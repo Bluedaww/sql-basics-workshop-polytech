@@ -1,0 +1,91 @@
+-- ============================================
+-- Exercice 8 : Analyse de performance et création d'index
+-- Réalisé par : Authier Lucas
+-- Date : 01/06/2026
+-- ============================================
+
+-- ============================================================
+-- Étape 4 : Analyse du plan d'exécution SANS index
+-- ============================================================
+
+-- Temps d'exécution relevé : planning ~1ms, execution ~255ms (inclusive Sort)
+--
+-- Observations :
+--
+-- 1. Trois Seq Scan  détectés :
+--    - Seq Scan on public.streamer       → 50 000 lignes lues, 45 001 éliminées par le filtre
+--    - Seq Scan on public.stream         → 100 000 lignes lues intégralement
+--    - Seq Scan on public.participation_defi → 249 987 lignes lues intégralement
+--    - Seq Scan on public.defi           → 50 000 lignes lues intégralement
+--
+-- 2. Opérations les plus coûteuses (temps inclusif) :
+--    - Sort (node 1)            : 255.28 ms  — tri final sur 24 771 lignes
+--    - Aggregate (node 2)       : 155.11 ms  — GROUP BY sur 166 662 lignes estimées
+--    - Hash Inner Join defi     : 128.66 ms  — jointure pd.id_defi = d.id_defi
+--    - Hash Inner Join streamer : 95.43 ms   — jointure pd.id_streamer = s.id_streamer
+--
+-- 3. Rows X > 1 sur plusieurs nœuds (ex: ↑ 3.16 sur les Hash Inner Join)
+--    indique que PostgreSQL a sous-estimé le nombre de lignes intermédiaires
+--    (estimation 166 662, réalité 52 775)
+--
+-- Conclusion : Sans index sur les clés étrangères de participation_defi et stream,
+-- PostgreSQL est contraint de scanner chaque table entièrement avant de joindre.
+
+-- ============================================================
+-- Étape 6 : Analyse comparative AVEC index
+-- ============================================================
+
+-- Temps d'exécution relevé : execution ~181ms (inclusive Sort) — soit un gain de ~29%
+-- (255ms → 181ms)
+--
+-- Changements observés dans le plan :
+--
+-- 1. Index Scan utilisé pour stream (node 14) :
+--    - "Index Scan using idx_stream_id_streamer on public.stream as st"
+--    - 7.78ms pour 9 952 lignes réelles vs 100 000 lignes avant (Seq Scan)
+--    - PostgreSQL ne scanne plus toute la table stream grâce à l'index sur id_streamer
+--    - Rows X ↑ 10.05 : l'estimateur sous-estimait encore, mais le scan reste bien plus rapide
+--
+-- 2. Nouveau nœud Materialize (node 13) :
+--    - Matérialise le résultat de l'Index Scan en mémoire (3.44ms)
+--    - Permet de réutiliser le résultat pour le Merge Left Join sans rescanner
+--
+-- 3. Gather Merge + Merge Left Join (nodes 3-4) remplacent le Hash Right Join :
+--    - PostgreSQL exploite le parallélisme (Loops: 2 sur plusieurs nœuds)
+--    - Le Merge Left Join (94.59ms) est plus efficace car les données arrivent
+--      déjà triées depuis l'index
+--
+-- 4. Seq Scan maintenus (sans amélioration) :
+--    - participation_defi : toujours ~125 000 lignes (Loops: 2, soit ~250K total)
+--    - streamer : toujours Seq Scan, 45 001 lignes éliminées par le filtre
+--    - defi : toujours Seq Scan sur 50 000 lignes
+--    → L'opération arithmétique (id_streamer + 0) bloque les index B-Tree sur ces tables
+--
+-- Bilan comparatif :
+--    Avant index : 255ms  |  Après index : 181ms  |  Gain : ~29%
+--    Amélioration principale : stream passe de Seq Scan (100K lignes) à Index Scan (9 952 lignes)
+
+-- ============================================================
+-- Étape 8 : Conclusion
+-- ============================================================
+
+-- Résultats :
+--    Sans index  : 255ms
+--    Avec index  : 181ms  → gain ~29%
+--    Avec trigram: 153ms  → gain ~40% au total
+--
+-- 1. Les index les plus utiles :
+--    - idx_stream_id_streamer : le plus efficace, PostgreSQL passe d'un Seq Scan
+--      sur 100 000 lignes à un Index Scan sur ~10 000 lignes
+--    - idx_streamer_pseudo_trgm : permet d'utiliser un Bitmap Index Scan
+--      sur les recherches LIKE au lieu de tout scanner
+--    - Les index sur participation_defi n'ont pas été utilisés à cause du
+--      WHERE (id_streamer + 0) qui empêche l'optimiseur de s'en servir
+--
+-- 2. Pourquoi participation_defi était lente sans index ?
+--    La table fait ~250 000 lignes. Sans index, PostgreSQL doit tout lire
+--    pour trouver les correspondances, ce qui est très coûteux sur les jointures.
+--
+-- 3. Gain global : ~40% (255ms → 153ms)
+--    On aurait pu faire mieux en écrivant id_streamer < 5000 directement
+--    mais le but de l'exercice était justement de bloquer certains index.
